@@ -23,7 +23,21 @@ import { z } from "zod";
  */
 
 const API_BASE = "https://api.openai.com/v1";
-const MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1.5";
+
+// Non-flagship default (cheaper/faster). Overridable via env.
+const DEFAULT_MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1.5";
+
+/**
+ * Intelligent model rotation.
+ *  - An explicit model always wins.
+ *  - "auto" (default): flagship gpt-image-2 for high-quality/final renders,
+ *    the cheaper/faster DEFAULT_MODEL (gpt-image-1.5) for everything else.
+ */
+function pickModel(model?: string, quality?: string): string {
+  if (model && model !== "auto") return model;
+  if (quality === "high") return "gpt-image-2";
+  return DEFAULT_MODEL;
+}
 
 // Image generation can take a while; give the function room (seconds).
 export const maxDuration = 300;
@@ -65,18 +79,35 @@ async function hostImages(b64List: string[], prompt: string): Promise<string[]> 
   return urls;
 }
 
-function ok(urls: string[], b64List: string[]) {
-  const text =
+type Content =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+
+function ok(urls: string[], b64List: string[], modelUsed: string, includeB64: boolean) {
+  const header =
     urls.length === 1
-      ? `Image generated. Public URL (use this in <img src> / markdown):\n${urls[0]}`
-      : `Images generated. Public URLs:\n${urls.join("\n")}`;
-  return {
-    content: [
-      { type: "text" as const, text },
-      // First image inline so the model can also see what it made.
-      { type: "image" as const, data: b64List[0], mimeType: "image/png" },
-    ],
-  };
+      ? `Image generated with ${modelUsed}. Public URL (embed in <img src> / markdown):\n${urls[0]}`
+      : `Images generated with ${modelUsed}. Public URLs:\n${urls.join("\n")}`;
+
+  const content: Content[] = [
+    { type: "text", text: header },
+    // First image inline so the model can also see what it made.
+    { type: "image", data: b64List[0], mimeType: "image/png" },
+  ];
+
+  if (includeB64) {
+    // For egress-restricted sandboxes (Cowork/Design) that get a 403 fetching the
+    // Blob URL: hand over the raw base64 so they can decode it to a file locally,
+    // no network needed —  e.g.  echo '<b64>' | base64 -d > image.png
+    content.push({
+      type: "text",
+      text:
+        "Raw base64 PNG (decode to a file for in-sandbox compositing, no network fetch):\n" +
+        b64List.map((b, i) => `--- image ${i + 1} (base64) ---\n${b}`).join("\n"),
+    });
+  }
+
+  return { content };
 }
 
 function fail(err: unknown) {
@@ -91,7 +122,10 @@ const handler = createMcpHandler((server) => {
   server.tool(
     "generate_image",
     "Generate an image from a text prompt using OpenAI, host it, and return a PUBLIC URL you can embed " +
-      "directly in HTML pages, slides, or markdown. Write a detailed prompt — subject, style, lighting, composition.",
+      "directly in HTML pages, slides, or markdown. Write a detailed prompt — subject, style, lighting, composition. " +
+      "Model rotation: leave model on 'auto' (gpt-image-2 for high quality, gpt-image-1.5 otherwise) or set it explicitly. " +
+      "If you are in a sandbox that gets a 403 fetching the returned URL, pass include_base64=true and decode the base64 to a file. " +
+      "Note: image models garble non-Latin scripts (e.g. Bengali) — generate art WITHOUT text and typeset the words yourself.",
     {
       prompt: z.string().describe("Detailed description of the image to generate."),
       size: z
@@ -103,12 +137,27 @@ const handler = createMcpHandler((server) => {
         .optional()
         .describe("Higher quality costs more. Use low for drafts."),
       n: z.number().int().min(1).max(4).optional().describe("How many variations (default 1)."),
+      model: z
+        .enum(["auto", "gpt-image-1.5", "gpt-image-2"])
+        .optional()
+        .describe(
+          "Which OpenAI image model. 'auto' (default) uses gpt-image-2 when quality=high, else gpt-image-1.5. " +
+            "Pick gpt-image-2 for final/hero art, gpt-image-1.5 for drafts and iteration.",
+        ),
+      include_base64: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also return the raw base64 PNG. Use when a sandbox can't fetch the URL (403 allowlist) and you need " +
+            "the bytes to composite or edit the image locally.",
+        ),
     },
-    async ({ prompt, size, quality, n }) => {
+    async ({ prompt, size, quality, n, model, include_base64 }) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
-        const body: Record<string, unknown> = { model: MODEL, prompt, n: n ?? 1 };
+        const chosen = pickModel(model, quality);
+        const body: Record<string, unknown> = { model: chosen, prompt, n: n ?? 1 };
         if (size) body.size = size;
         if (quality) body.quality = quality;
 
@@ -121,7 +170,7 @@ const handler = createMcpHandler((server) => {
         if (!res.ok) throw new Error(json?.error?.message ?? `HTTP ${res.status}`);
 
         const images = await extractImages(json);
-        return ok(await hostImages(images, prompt), images);
+        return ok(await hostImages(images, prompt), images, chosen, !!include_base64);
       } catch (err) {
         return fail(err);
       }
@@ -138,15 +187,24 @@ const handler = createMcpHandler((server) => {
       mask_url: z.string().url().optional().describe("Public URL of an optional PNG mask."),
       size: z.enum(["1024x1024", "1024x1536", "1536x1024", "auto"]).optional(),
       quality: z.enum(["low", "medium", "high", "auto"]).optional(),
+      model: z
+        .enum(["auto", "gpt-image-1.5", "gpt-image-2"])
+        .optional()
+        .describe("Which model. 'auto' (default): gpt-image-2 when quality=high, else gpt-image-1.5."),
+      include_base64: z
+        .boolean()
+        .optional()
+        .describe("Also return raw base64 PNG (for sandboxes that get a 403 fetching the URL)."),
     },
-    async ({ image_url, prompt, mask_url, size, quality }) => {
+    async ({ image_url, prompt, mask_url, size, quality, model, include_base64 }) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
+        const chosen = pickModel(model, quality);
 
         const imgBuf = Buffer.from(await (await fetch(image_url)).arrayBuffer());
         const form = new FormData();
-        form.append("model", MODEL);
+        form.append("model", chosen);
         form.append("prompt", prompt);
         form.append("image", new Blob([imgBuf], { type: "image/png" }), "image.png");
         if (mask_url) {
@@ -165,7 +223,7 @@ const handler = createMcpHandler((server) => {
         if (!res.ok) throw new Error(json?.error?.message ?? `HTTP ${res.status}`);
 
         const images = await extractImages(json);
-        return ok(await hostImages(images, prompt), images);
+        return ok(await hostImages(images, prompt), images, chosen, !!include_base64);
       } catch (err) {
         return fail(err);
       }

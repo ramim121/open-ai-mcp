@@ -27,9 +27,15 @@ const API_BASE = "https://api.openai.com/v1";
 // Non-flagship default (cheaper/faster). Overridable via env.
 const DEFAULT_MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1.5";
 
-// Bengali/Bangla script renders far better on gpt-image-2, so force it when the
-// prompt contains Bengali characters (U+0980–U+09FF).
-const BENGALI = /[ঀ-৿]/;
+// Bengali/Bangla script renders far better on gpt-image-2. Detect by numeric
+// codepoint (U+0980–U+09FF) — no regex literal, so it survives minification.
+function hasBengali(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0x0980 && c <= 0x09ff) return true;
+  }
+  return false;
+}
 
 /**
  * Intelligent model rotation.
@@ -40,7 +46,7 @@ const BENGALI = /[ঀ-৿]/;
  */
 function pickModel(model: string | undefined, quality: string | undefined, prompt: string): string {
   if (model && model !== "auto") return model;
-  if (BENGALI.test(prompt)) return "gpt-image-2";
+  if (hasBengali(prompt)) return "gpt-image-2";
   if (quality === "high") return "gpt-image-2";
   return DEFAULT_MODEL;
 }

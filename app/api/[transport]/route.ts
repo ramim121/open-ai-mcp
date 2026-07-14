@@ -27,14 +27,20 @@ const API_BASE = "https://api.openai.com/v1";
 // Non-flagship default (cheaper/faster). Overridable via env.
 const DEFAULT_MODEL = process.env.OPENAI_IMAGE_MODEL ?? "gpt-image-1.5";
 
+// Bengali/Bangla script renders far better on gpt-image-2, so force it when the
+// prompt contains Bengali characters (U+0980–U+09FF).
+const BENGALI = /[ঀ-৿]/;
+
 /**
  * Intelligent model rotation.
  *  - An explicit model always wins.
- *  - "auto" (default): flagship gpt-image-2 for high-quality/final renders,
- *    the cheaper/faster DEFAULT_MODEL (gpt-image-1.5) for everything else.
+ *  - Prompt contains Bengali text -> gpt-image-2 (best at that script).
+ *  - "auto" + quality=high -> flagship gpt-image-2 for final renders.
+ *  - Otherwise the cheaper/faster DEFAULT_MODEL (gpt-image-1.5).
  */
-function pickModel(model?: string, quality?: string): string {
+function pickModel(model: string | undefined, quality: string | undefined, prompt: string): string {
   if (model && model !== "auto") return model;
+  if (BENGALI.test(prompt)) return "gpt-image-2";
   if (quality === "high") return "gpt-image-2";
   return DEFAULT_MODEL;
 }
@@ -123,19 +129,21 @@ const handler = createMcpHandler((server) => {
     "generate_image",
     "Generate an image from a text prompt using OpenAI, host it, and return a PUBLIC URL you can embed " +
       "directly in HTML pages, slides, or markdown. Write a detailed prompt — subject, style, lighting, composition. " +
-      "Model rotation: leave model on 'auto' (gpt-image-2 for high quality, gpt-image-1.5 otherwise) or set it explicitly. " +
-      "If you are in a sandbox that gets a 403 fetching the returned URL, pass include_base64=true and decode the base64 to a file. " +
-      "Note: image models garble non-Latin scripts (e.g. Bengali) — generate art WITHOUT text and typeset the words yourself.",
+      "Model: leave 'auto' (gpt-image-1.5 for most work; gpt-image-2 auto-selected for Bengali text or quality=high) or set it. " +
+      "gpt-image-2 handles Bengali/Bangla text well, so prefer it when the image must render Bangla words. " +
+      "Match size and quality to the NEED — do NOT default to high quality or large sizes. Use 1024x1024 + low/medium for " +
+      "drafts, icons, thumbnails, simple graphics; reserve high quality and 1536-wide/tall sizes for detailed hero/print art. " +
+      "If a sandbox gets a 403 fetching the returned URL, pass include_base64=true and decode the base64 to a file.",
     {
       prompt: z.string().describe("Detailed description of the image to generate."),
       size: z
         .enum(["1024x1024", "1024x1536", "1536x1024", "auto"])
         .optional()
-        .describe("Square, portrait, or landscape."),
+        .describe("Square/portrait/landscape. Default to 1024x1024 unless the layout truly needs a larger/other aspect."),
       quality: z
         .enum(["low", "medium", "high", "auto"])
         .optional()
-        .describe("Higher quality costs more. Use low for drafts."),
+        .describe("Cost scales with quality. Use low/medium by default; only use high when detail genuinely matters."),
       n: z.number().int().min(1).max(4).optional().describe("How many variations (default 1)."),
       model: z
         .enum(["auto", "gpt-image-1.5", "gpt-image-2"])
@@ -156,7 +164,7 @@ const handler = createMcpHandler((server) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
-        const chosen = pickModel(model, quality);
+        const chosen = pickModel(model, quality, prompt);
         const body: Record<string, unknown> = { model: chosen, prompt, n: n ?? 1 };
         if (size) body.size = size;
         if (quality) body.quality = quality;
@@ -200,7 +208,7 @@ const handler = createMcpHandler((server) => {
       try {
         const key = process.env.OPENAI_API_KEY;
         if (!key) throw new Error("OPENAI_API_KEY not set on the server.");
-        const chosen = pickModel(model, quality);
+        const chosen = pickModel(model, quality, prompt);
 
         const imgBuf = Buffer.from(await (await fetch(image_url)).arrayBuffer());
         const form = new FormData();
